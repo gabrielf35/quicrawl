@@ -17,7 +17,7 @@ async fn main() {
 
     for line in seeds {
         tasks.spawn(async move {
-            help::crawl_url(&line).await;
+            help::crawl_url(line.to_string()).await;
         });
     }
 
