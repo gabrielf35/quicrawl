@@ -63,6 +63,7 @@ pub fn parse_title(html: &str) -> String {
 }
 
 pub async fn crawl_url(url: &str) {
+    println!("spawned crawler for {url}");
     let response = get(url).await.unwrap();
     let links = parse_links(&response, url);
     let text = parse_text(&response);
