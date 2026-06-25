@@ -99,7 +99,15 @@ pub async fn crawl_url(url: String) {
         text: text,
     };
 
-    // println!("{:#?}", index_entry);
+    #[cfg(debug_assertions)]
+    println!("=== index_entry");
+    #[cfg(debug_assertions)]
+    println!("{:#?}", index_entry);
+
+    #[cfg(debug_assertions)]
+    println!("=== links");
+    #[cfg(debug_assertions)]
+    println!("{:#?}", &links);
 
     for link in links {
         spawn_crawl(link);
