@@ -16,8 +16,10 @@ async fn main() {
     for line in &seeds {
         let response = help::get(line).await.unwrap();
 
-        let links = help::parse_links(&response);
+        let links = help::parse_links(&response, line);
+        let text = help::parse_text(&response);
 
-        println!("{:#?}", links)
+        println!("{:#?}", links);
+        println!("{text}");
     }
 }

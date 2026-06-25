@@ -10,16 +10,32 @@ pub async fn get(url: &str) -> std::result::Result<String, reqwest::Error> {
     response.text().await
 }
 
-pub fn parse_links(html: &str) -> Vec<String> {
+pub fn parse_links(html: &str, original_link: &str) -> Vec<String> {
     let mut links: Vec<String> = Vec::new();
     let document = Html::parse_document(html);
     let selector = Selector::parse("a[href]").unwrap();
 
     for element in document.select(&selector) {
         if let Some(link) = element.value().attr("href") {
-            links.push(link.to_string());
+            if link.starts_with("/") {
+                links.push(original_link.to_string() + link)
+            } else {
+                links.push(link.to_string());
+            }
         }
     }
 
     links
+}
+
+pub fn parse_text(html: &str) -> String {
+    let document = Html::parse_document(html);
+    let selector = Selector::parse("body").unwrap();
+
+    if let Some(body) = document.select(&selector).next() {
+        let full_text = body.text().collect::<Vec<_>>().join(" ");
+        return full_text.split_whitespace().take(100).collect::<Vec<_>>().join(" ");
+    }
+
+    return "".to_string()
 }
