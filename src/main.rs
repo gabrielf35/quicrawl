@@ -14,12 +14,6 @@ async fn main() {
         .expect("failed to parse seeds.txt");
 
     for line in &seeds {
-        let response = help::get(line).await.unwrap();
-
-        let links = help::parse_links(&response, line);
-        let text = help::parse_text(&response);
-
-        println!("{:#?}", links);
-        println!("{text}");
+        help::crawl_url(&line).await;
     }
 }
