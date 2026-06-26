@@ -3,15 +3,21 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::fs;
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 
 static REQUEST_SEM: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(20)));
-static WRITE_SEM: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
+
 static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .user_agent("quicrawl (https://github.com/indium114/quicrawl)")
         .build()
         .unwrap()
+});
+
+static INDEX_SENDER: LazyLock<mpsc::UnboundedSender<Site>> = LazyLock::new(|| {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(writer_task(rx));
+    tx
 });
 
 static ROBOTS_CACHE: LazyLock<Mutex<HashMap<String, Arc<RobotsTxt>>>> =
@@ -90,6 +96,25 @@ impl RobotsTxt {
     }
 }
 
+async fn writer_task(mut rx: mpsc::UnboundedReceiver<Site>) {
+    let existing = load_index();
+    let mut seen: HashSet<String> = existing.iter().map(|s| s.url.clone()).collect();
+    let mut index: Vec<Site> = existing;
+    let mut pending: usize = 0;
+
+    while let Some(entry) = rx.recv().await {
+        if seen.insert(entry.url.clone()) {
+            index.push(entry);
+            pending += 1;
+        }
+        if pending >= 25 {
+            let _ = save_index(&index);
+            usefulog::hint(format!("wrote {} entries to disk", index.len()));
+            pending = 0;
+        }
+    }
+}
+
 fn extract_domain(url: &str) -> Option<&str> {
     let domain = url
         .strip_prefix("http://")
@@ -144,8 +169,8 @@ pub fn load_index() -> Vec<Site> {
         .unwrap_or_default()
 }
 
-pub fn save_index(index: Vec<Site>) -> bool {
-    match serde_json::to_string_pretty(&index) {
+pub fn save_index(index: &[Site]) -> bool {
+    match serde_json::to_string_pretty(index) {
         Ok(json) => fs::write("index.json", json).is_ok(),
         Err(_) => false,
     }
@@ -273,15 +298,5 @@ pub async fn crawl_url(url: String) {
     }
 
 
-    let mut index = load_index();
-    if index.contains(&index_entry) {
-        return
-    }
-    let write_permit = WRITE_SEM.acquire().await.unwrap();
-    index.push(index_entry);
-    let _ = save_index(index);
-
-    usefulog::hint(format!("wrote index entry to disk"));
-
-    drop(write_permit);
+    let _ = INDEX_SENDER.send(index_entry);
 }
