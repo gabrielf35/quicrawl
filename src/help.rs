@@ -1,6 +1,7 @@
 use scraper::{Html, Selector};
 use serde::{Serialize, Deserialize};
-use std::sync::{Arc, LazyLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio::sync::Semaphore;
 
 static SEM: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(20)));
@@ -10,6 +11,114 @@ static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .build()
         .unwrap()
 });
+
+static ROBOTS_CACHE: LazyLock<Mutex<HashMap<String, Arc<RobotsTxt>>>> = LazyLock::new(|| {
+    Mutex::new(HashMap::new())
+});
+
+static VISITED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| {
+    Mutex::new(HashSet::new())
+});
+
+struct RobotsTxt {
+    disallows: Vec<String>,
+    allows: Vec<String>,
+}
+
+impl RobotsTxt {
+    fn allow_all() -> Self {
+        RobotsTxt { disallows: Vec::new(), allows: Vec::new() }
+    }
+
+    fn parse(body: &str) -> Self {
+        let mut disallows = Vec::new();
+        let mut allows = Vec::new();
+        let mut in_my_section = false;
+
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(agent) = line.strip_prefix("User-agent:").map(|s| s.trim()) {
+                in_my_section = agent == "*" || agent.eq_ignore_ascii_case("quicrawl");
+            } else if in_my_section {
+                if let Some(path) = line.strip_prefix("Disallow:").map(|s| s.trim()) {
+                    if path.is_empty() {
+                        disallows.clear();
+                        allows.clear();
+                    } else {
+                        disallows.push(path.to_string());
+                    }
+                } else if let Some(path) = line.strip_prefix("Allow:").map(|s| s.trim()) {
+                    if !path.is_empty() {
+                        allows.push(path.to_string());
+                    }
+                }
+            }
+        }
+
+        RobotsTxt { disallows, allows }
+    }
+
+    fn is_allowed(&self, path: &str) -> bool {
+        let mut matched: Option<(usize, bool)> = None;
+
+        for d in &self.disallows {
+            if path.starts_with(d) {
+                let better = matched.map_or(true, |(len, _)| d.len() > len);
+                if better {
+                    matched = Some((d.len(), false));
+                }
+            }
+        }
+        for a in &self.allows {
+            if path.starts_with(a) {
+                let better = matched.map_or(true, |(len, allowed)| a.len() > len || (a.len() == len && !allowed));
+                if better {
+                    matched = Some((a.len(), true));
+                }
+            }
+        }
+
+        matched.map_or(true, |(_, allowed)| allowed)
+    }
+}
+
+fn extract_domain(url: &str) -> Option<&str> {
+    let domain = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"))?;
+    domain.split('/').next()
+}
+
+fn extract_path(url: &str) -> &str {
+    let after_scheme = url.strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    after_scheme.find('/').map_or("/", |i| &after_scheme[i..])
+}
+
+async fn ensure_robots(domain: &str, scheme: &str) -> Arc<RobotsTxt> {
+    {
+        let cache = ROBOTS_CACHE.lock().unwrap();
+        if let Some(rules) = cache.get(domain) {
+            return rules.clone();
+        }
+    }
+
+    let robots_url = format!("{}://{}/robots.txt", scheme, domain);
+    let robots = match CLIENT.get(&robots_url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.text().await {
+            Ok(body) => RobotsTxt::parse(&body),
+            Err(_) => RobotsTxt::allow_all(),
+        },
+        _ => RobotsTxt::allow_all(),
+    };
+    let robots = Arc::new(robots);
+
+    let mut cache = ROBOTS_CACHE.lock().unwrap();
+    cache.insert(domain.to_string(), robots.clone());
+    robots
+}
 
 // MARK: types
 #[derive(Debug, Deserialize, Serialize)]
@@ -33,9 +142,10 @@ pub fn parse_links(html: &str, original_link: &str) -> Vec<String> {
 
     for element in document.select(&selector) {
         if let Some(link) = element.value().attr("href") {
-            if link.starts_with("/") {
-                links.push(original_link.to_string() + link)
-            } else {
+            let link = link.trim();
+            if link.starts_with('/') {
+                links.push(original_link.to_string() + link);
+            } else if link.starts_with("http://") || link.starts_with("https://") {
                 links.push(link.to_string());
             }
         }
@@ -75,7 +185,25 @@ pub fn spawn_crawl(url: String) {
 
 pub async fn crawl_url(url: String) {
     let id = tokio::task::id();
+
+    {
+        let mut visited = VISITED.lock().unwrap();
+        if !visited.insert(url.clone()) {
+            usefulog::log(format!("task {id} skipped {url} (already visited)"));
+            return;
+        }
+    }
+
     usefulog::log(format!("task {id} crawling {url}"));
+
+    if let Some(domain) = extract_domain(&url) {
+        let scheme = if url.starts_with("https://") { "https" } else { "http" };
+        let robots = ensure_robots(domain, scheme).await;
+        if !robots.is_allowed(extract_path(&url)) {
+            usefulog::log(format!("task {id} skipped {url} (blocked by robots.txt)"));
+            return;
+        }
+    }
 
     let permit = SEM.acquire().await.unwrap();
 
